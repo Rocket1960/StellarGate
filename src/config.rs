@@ -80,6 +80,52 @@ impl Config {
     }
 }
 
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("port", &self.port)
+            .field("database_url", &self.database_url)
+            .field("network", &self.network)
+            .field("horizon_url", &self.horizon_url)
+            .field("gateway_public", &self.gateway_public)
+            .field("gateway_secret", &"***")
+            .field("usdc_issuer", &self.usdc_issuer)
+            .field("webhook_secret", &"***")
+            .field("webhook_retry_attempts", &self.webhook_retry_attempts)
+            .field("webhook_retry_delay_ms", &self.webhook_retry_delay_ms)
+            .field("poll_interval_secs", &self.poll_interval_secs)
+            .field("cors_allowed_origins", &self.cors_allowed_origins)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let cfg = Config {
+            port: 3000,
+            database_url: "sqlite:test.db".into(),
+            network: "testnet".into(),
+            horizon_url: "https://horizon-testnet.stellar.org".into(),
+            gateway_public: "GPUBLIC".into(),
+            gateway_secret: "super-secret-key".into(),
+            usdc_issuer: "GISSUER".into(),
+            webhook_secret: "webhook-hmac-secret".into(),
+            webhook_retry_attempts: 3,
+            webhook_retry_delay_ms: 5000,
+            poll_interval_secs: 10,
+            cors_allowed_origins: vec![],
+        };
+        let output = format!("{cfg:?}");
+        assert!(!output.contains("super-secret-key"), "gateway_secret must not appear in Debug output");
+        assert!(!output.contains("webhook-hmac-secret"), "webhook_secret must not appear in Debug output");
+        assert!(output.contains("***"), "redacted marker must appear in Debug output");
+    }
+}
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
