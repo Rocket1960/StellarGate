@@ -1,5 +1,29 @@
 use anyhow::Result;
 
+/// How the service detects incoming on-chain payments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListenerMode {
+    /// Subscribe to Horizon's Server-Sent-Events payment stream for near
+    /// real-time settlement, with the interval poller running alongside as a
+    /// reconciler for any events missed during reconnects.
+    Stream,
+    /// Only run the interval poller; no streaming connection is opened.
+    Poll,
+}
+
+impl ListenerMode {
+    fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "poll" => Self::Poll,
+            "stream" => Self::Stream,
+            other => {
+                tracing::warn!("invalid STELLAR_LISTENER_MODE={other:?}, using \"stream\"");
+                Self::Stream
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub port: u16,

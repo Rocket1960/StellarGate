@@ -75,6 +75,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)")
         .execute(pool)
         .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_payments_created_id ON payments(created_at DESC, id DESC)",
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS webhook_deliveries (
@@ -86,6 +91,18 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             attempts INTEGER NOT NULL DEFAULT 0,
             last_attempt TEXT,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Durable key/value state — used by the Horizon poller to persist its
+    // paging cursor so it resumes exactly where it left off across restarts.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS kv_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
         )",
     )
     .execute(pool)
@@ -242,6 +259,65 @@ pub async fn list_payments(
     Ok((rows.iter().map(row_to_payment).collect(), total))
 }
 
+pub async fn list_payments_keyset(
+    pool: &Db,
+    status: Option<&str>,
+    limit: i64,
+    cursor: Option<(&str, &str)>,
+) -> Result<Vec<Payment>> {
+    let rows = match (status, cursor) {
+        (None, None) => sqlx::query(
+            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+                    webhook_url, tx_hash, paid_amount, created_at, updated_at
+             FROM payments ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await?,
+
+        (None, Some((ts, cid))) => sqlx::query(
+            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+                    webhook_url, tx_hash, paid_amount, created_at, updated_at
+             FROM payments
+             WHERE (created_at < ? OR (created_at = ? AND id < ?))
+             ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(ts)
+        .bind(ts)
+        .bind(cid)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?,
+
+        (Some(s), None) => sqlx::query(
+            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+                    webhook_url, tx_hash, paid_amount, created_at, updated_at
+             FROM payments WHERE status = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(s)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?,
+
+        (Some(s), Some((ts, cid))) => sqlx::query(
+            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+                    webhook_url, tx_hash, paid_amount, created_at, updated_at
+             FROM payments
+             WHERE status = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+             ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(s)
+        .bind(ts)
+        .bind(ts)
+        .bind(cid)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?,
+    };
+
+    Ok(rows.iter().map(row_to_payment).collect())
+}
+
 /// All payments still awaiting confirmation, oldest first. Used by the Horizon
 /// poller to decide which memos to watch for on-chain. Rows whose TTL has
 /// elapsed are excluded even if the sweeper hasn't transitioned them yet, so an
@@ -328,6 +404,31 @@ pub async fn update_payment_status(
     .bind(tx_hash)
     .bind(paid_amount)
     .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Read a value from the durable key/value state table, if present.
+pub async fn get_state(pool: &Db, key: &str) -> Result<Option<String>> {
+    let value: Option<String> = sqlx::query_scalar("SELECT value FROM kv_state WHERE key = ?")
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(value)
+}
+
+/// Insert or update a value in the durable key/value state table.
+pub async fn set_state(pool: &Db, key: &str, value: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO kv_state (key, value, updated_at)
+         VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = excluded.updated_at",
+    )
+    .bind(key)
+    .bind(value)
     .execute(pool)
     .await?;
     Ok(())

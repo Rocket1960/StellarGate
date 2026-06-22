@@ -32,7 +32,12 @@ async fn main() -> Result<()> {
         http,
     });
 
-    // Background reconciliation of pending payments against Horizon.
+    // Detect on-chain payments. In stream mode the SSE listener settles intents
+    // in near real time while the poller runs alongside as a reconciler; in
+    // poll mode only the interval poller runs.
+    if cfg.listener_mode == ListenerMode::Stream {
+        tokio::spawn(horizon::run_stream_listener(state.clone()));
+    }
     tokio::spawn(horizon::run_poller(state.clone()));
 
     // Background expiry of pending intents that pass their TTL.

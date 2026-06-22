@@ -25,7 +25,7 @@ This project is under active development. The following is implemented:
 - [x] `GET /health` — health check
 - [x] SQLite persistence
 - [x] Input validation (asset, amount as exact stroops, webhook URL)
-- [x] Transaction listener (Horizon polling)
+- [x] Transaction listener (Horizon SSE streaming + interval polling)
 - [x] Payment verification (memo + asset + amount)
 - [x] Webhook dispatch (HMAC-SHA256 signed, with retries)
 - [x] Multi-merchant support (`merchant_id` per payment)
@@ -68,6 +68,7 @@ cp .env.example .env
 | `STELLAR_GATEWAY_PUBLIC` | Your gateway wallet public key | — |
 | `STELLAR_GATEWAY_SECRET` | Your gateway wallet secret key | — |
 | `USDC_ISSUER` | USDC issuer address | testnet issuer |
+| `STELLAR_LISTENER_MODE` | `stream` (SSE + poller reconciler) or `poll` (interval only) | `stream` |
 | `POLL_INTERVAL_SECS` | How often the Horizon poller reconciles | `10` |
 | `PAYMENT_TTL_SECS` | How long a payment intent stays `pending` before it is expired (from `created_at`) | `3600` |
 | `WEBHOOK_SECRET` | HMAC signing secret for webhooks | — |
@@ -77,11 +78,39 @@ cp .env.example .env
 
 > `DATABASE_URL` is a sqlx connection string (`sqlite:stellargate.db`), not a
 > file path. The Horizon poller stays idle until `STELLAR_GATEWAY_PUBLIC` is set.
+> The poller pages forward through payments from a cursor persisted in the
+> database, so it never misses an intent regardless of on-chain volume and
+> resumes from where it left off after a restart.
 
 ### Run
 
 ```bash
 cargo run
+```
+
+### Docker Compose
+
+The quickest way to run StellarGate without installing Rust:
+
+```bash
+cp .env.example .env
+# Edit .env with your Stellar keys, then:
+docker compose up --build
+```
+
+The API will be available at `http://localhost:3000`. The SQLite database is
+stored in a named Docker volume (`stellargate_data`) so it persists across
+container restarts. Verify the service is healthy:
+
+```bash
+curl http://localhost:3000/health
+# {"status":"ok"}
+```
+
+To stop and remove containers while keeping the database volume:
+
+```bash
+docker compose down
 ```
 
 ### Test
@@ -203,22 +232,83 @@ List payments, newest first.
 1. Developer calls POST /payments
 2. StellarGate returns { destination_address, memo, amount }
 3. End user sends payment via any Stellar wallet
-4. StellarGate listener detects the transaction on Horizon
+4. StellarGate listener detects the transaction on Horizon (SSE stream, ~1s; poller as fallback)
 5. Verifies: correct memo + amount + asset
-6. Updates payment status to "completed"
-7. POSTs webhook event to developer's webhook_url
+6. Updates payment status and fires a webhook event
 ```
+
+## Payment Resolution Policy
+
+Every on-chain payment matched by memo, destination, and asset is resolved as follows:
+
+| Scenario | `status` | Webhook event | `delta` field |
+|---|---|---|---|
+| Paid exactly the requested amount | `completed` | `payment.completed` | not present |
+| Paid **more** than requested | `completed` | `payment.overpaid` | excess amount (should be refunded) |
+| Paid **less** than requested | `underpaid` | `payment.underpaid` | shortfall still owed |
+| Top-up brings cumulative total to exactly expected | `completed` | `payment.completed` | not present |
+| Top-up brings cumulative total above expected | `completed` | `payment.overpaid` | cumulative excess |
+
+**Overpayment:** The intent is fulfilled and moves to `completed`. The `payment.overpaid` event includes a `delta` field showing the excess amount the merchant should consider refunding to the sender.
+
+**Underpayment:** The intent moves to `underpaid` and remains watchable. StellarGate continues polling for a follow-up payment to the same memo. When the cumulative total meets or exceeds the requested amount, the intent completes normally.
+
+**Top-up limitation:** Only a single follow-up payment is tracked per underpaid intent. If multiple partial payments are needed, the sender should consolidate them — send the full remaining shortfall (shown in `delta`) in one transaction.
+
+**Post-completion payments:** Once an intent reaches `completed`, any further on-chain payments to the same address and memo are not tracked and will not trigger additional webhooks.
 
 ## Webhook Events
 
+### `payment.completed`
+
+Fired when the cumulative received amount equals the requested amount exactly.
+
 ```json
 {
-  "event": "payment.success",
+  "event": "payment.completed",
   "payment_id": "a1b2c3d4-...",
+  "merchant_id": "your-merchant-id",
   "tx_hash": "abc123...",
   "amount": "10.00",
-  "paid_amount": "10.00",
-  "asset": "XLM"
+  "paid_amount": "10",
+  "asset": "XLM",
+  "status": "completed"
+}
+```
+
+### `payment.overpaid`
+
+Fired when the cumulative received amount exceeds the requested amount. `delta` is the excess the merchant should refund.
+
+```json
+{
+  "event": "payment.overpaid",
+  "payment_id": "a1b2c3d4-...",
+  "merchant_id": "your-merchant-id",
+  "tx_hash": "abc123...",
+  "amount": "10.00",
+  "paid_amount": "12.5",
+  "asset": "XLM",
+  "status": "completed",
+  "delta": "2.5"
+}
+```
+
+### `payment.underpaid`
+
+Fired when a payment is received but falls short of the requested amount. `delta` is the remaining shortfall. The intent stays open for a top-up.
+
+```json
+{
+  "event": "payment.underpaid",
+  "payment_id": "a1b2c3d4-...",
+  "merchant_id": "your-merchant-id",
+  "tx_hash": "abc123...",
+  "amount": "10.00",
+  "paid_amount": "7",
+  "asset": "XLM",
+  "status": "underpaid",
+  "delta": "3"
 }
 ```
 
@@ -233,7 +323,7 @@ Webhooks are signed with `X-StellarGate-Signature` (HMAC-SHA256) so you can veri
 
 ```
 src/
-├── main.rs          # Entry point, server startup, poller spawn, graceful shutdown
+├── main.rs          # Entry point, server startup, listener/poller spawn, graceful shutdown
 ├── lib.rs           # Shared state and module exports
 ├── config.rs        # Environment configuration
 ├── db.rs            # Database queries (SQLite)
